@@ -1,0 +1,118 @@
+name: AulaStock CI CD
+on:
+  push:
+    branches: [main, ci-setup]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [A, B]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: aulastock
+          POSTGRES_USER: aulastock
+          POSTGRES_PASSWORD: ci-only-password
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U aulastock -d aulastock"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      DJANGO_SECRET_KEY: ci-only-key-not-for-production
+      POSTGRES_DB: aulastock
+      POSTGRES_USER: aulastock
+      POSTGRES_PASSWORD: ci-only-password
+      POSTGRES_HOST: 127.0.0.1
+      PRODUCT_VARIANT: ${{ matrix.variant }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Verificar configuración y migraciones
+        run: |
+          python manage.py check
+          python manage.py makemigrations --check --dry-run
+      - name: Pruebas con PostgreSQL
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p artifacts
+          python manage.py test --verbosity 2 2>&1 | tee artifacts/tests-${{ matrix.variant }}.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tests-${{ matrix.variant }}-${{ github.sha }}
+          path: artifacts/tests-${{ matrix.variant }}.txt
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Construir y exportar imagen
+        run: |
+          mkdir -p artifacts
+          docker build -t aulastock:${{ github.sha }} .
+          docker save aulastock:${{ github.sha }} -o artifacts/aulastock-image.tar
+          sha256sum artifacts/aulastock-image.tar > artifacts/aulastock-image.tar.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ github.sha }}
+          path: artifacts/*
+          retention-days: 7
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      APP_IMAGE: aulastock:${{ github.sha }}
+      DJANGO_SECRET_KEY: local-runner-key-not-for-production
+      POSTGRES_PASSWORD: local-runner-password
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-${{ github.sha }}
+          path: artifacts
+      - name: Verificar y cargar imagen
+        run: |
+          sha256sum -c artifacts/aulastock-image.tar.sha256
+          docker load -i artifacts/aulastock-image.tar
+      - name: Desplegar en carpeta externa y comprobar respuesta
+        shell: bash
+        run: |
+          DEPLOY_DIR="$RUNNER_TEMP/aulastock-deploy"
+          mkdir -p "$DEPLOY_DIR"
+          cp docker-compose.yml "$DEPLOY_DIR/"
+          cd "$DEPLOY_DIR"
+          docker compose up -d --no-build --wait --wait-timeout 180
+          docker compose exec -T web python manage.py seed_demo
+          mkdir -p "$GITHUB_WORKSPACE/evidence"
+          curl --fail http://127.0.0.1:8000/health/ | tee "$GITHUB_WORKSPACE/evidence/health.json"
+          curl --fail http://127.0.0.1:8000/ -o "$GITHUB_WORKSPACE/evidence/home.html"
+          docker compose ps > "$GITHUB_WORKSPACE/evidence/containers.txt"
+      - name: Recoger logs y detener contenedores
+        if: always()
+        shell: bash
+        run: |
+          DEPLOY_DIR="$RUNNER_TEMP/aulastock-deploy"
+          mkdir -p evidence
+          if [ -f "$DEPLOY_DIR/docker-compose.yml" ]; then
+            docker compose -f "$DEPLOY_DIR/docker-compose.yml" logs > evidence/compose.log 2>&1
+            docker compose -f "$DEPLOY_DIR/docker-compose.yml" down
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: deploy-${{ github.sha }}
+          path: evidence/

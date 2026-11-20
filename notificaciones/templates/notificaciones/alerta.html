@@ -1,0 +1,1 @@
+{% if stock_bajo %}<div class="alert"><strong>⚠ Stock bajo:</strong> {{ stock_bajo|length }} equipo{{ stock_bajo|length|pluralize }} con {{ stock_umbral }} unidades o menos. <a href="{% url 'notificaciones:stock_bajo' %}">Ver detalle</a></div>{% endif %}
